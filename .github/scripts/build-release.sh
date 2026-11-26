@@ -41,7 +41,7 @@ plist="$app/Contents/Info.plist"
 test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$plist")" = "$build_number"
 test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$plist")" = "$version"
 test "$(/usr/libexec/PlistBuddy -c 'Print SUPublicEDKey' "$plist")" = "$SPARKLE_PUBLIC_KEY"
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/UVFormatter"
+lipo "$app/Contents/MacOS/UVFormatter" -verify_arch arm64 x86_64
 codesign --verify --deep --strict "$app"
 codesign --display --verbose=4 "$app" 2>&1 | grep '^Authority=Developer ID Application:'
 
