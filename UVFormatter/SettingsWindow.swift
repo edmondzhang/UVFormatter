@@ -11,12 +11,14 @@ final class SettingsWindow: NSWindowController {
     private let startupStatus = NSTextField(wrappingLabelWithString: "")
     private let login = NSButton(checkboxWithTitle: "登录时启动", target: nil, action: nil)
     private let autoUpdate = NSButton(checkboxWithTitle: "自动检查更新", target: nil, action: nil)
+    private let diagnosticsEnabled = NSButton(checkboxWithTitle: "保存本地解析诊断（默认开启）", target: nil, action: nil)
+    private let diagnosticsStatus = NSTextField(wrappingLabelWithString: "")
     private let sample = NSTextView(frame: .zero)
     private var capture: Any?
 
     init(registration: HotKeyRegistration, updaterAvailable: Bool, automaticallyChecks: Bool) {
         self.registration = registration
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 515),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 680),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "UVFormatter 设置"
         window.isReleasedWhenClosed = false
@@ -34,6 +36,9 @@ final class SettingsWindow: NSWindowController {
         autoUpdate.setAccessibilityIdentifier("automatic-updates")
         autoUpdate.state = automaticallyChecks ? .on : .off
         autoUpdate.isEnabled = updaterAvailable
+        diagnosticsEnabled.target = self
+        diagnosticsEnabled.action = #selector(toggleDiagnostics)
+        diagnosticsEnabled.setAccessibilityIdentifier("diagnostics-enabled")
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -60,6 +65,11 @@ final class SettingsWindow: NSWindowController {
             NSTextField(labelWithString: "选中示例文本后按快捷键，测试读取与替换。"),
             scroll, login, startupStatus, autoUpdate,
             button("检查更新…", #selector(checkUpdates), "check-updates"),
+            heading("解析诊断日志"),
+            diagnosticsEnabled,
+            diagnosticsStatus,
+            row([button("打开日志目录", #selector(openDiagnostics), "open-diagnostics"),
+                 button("清除日志", #selector(clearDiagnostics), "clear-diagnostics")]),
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -75,10 +85,12 @@ final class SettingsWindow: NSWindowController {
             shortcutStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
             permissionStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
             startupStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            diagnosticsStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         window.delegate = self
         refreshShortcut()
         refreshPermissions()
+        refreshDiagnostics()
     }
 
     required init?(coder: NSCoder) { nil }
@@ -89,6 +101,7 @@ final class SettingsWindow: NSWindowController {
     override func showWindow(_ sender: Any?) {
         refreshShortcut()
         refreshPermissions()
+        refreshDiagnostics()
         super.showWindow(sender)
         window?.makeKeyAndOrderFront(sender)
     }
@@ -118,6 +131,41 @@ final class SettingsWindow: NSWindowController {
 
     @objc private func toggleUpdates() { onToggleUpdates?(autoUpdate.state == .on) }
     @objc private func checkUpdates() { onCheckUpdates?() }
+
+    /// Persists the user's choice for subsequent local parser events.
+    @objc private func toggleDiagnostics() {
+        DiagnosticsStore.shared.setEnabled(diagnosticsEnabled.state == .on)
+        refreshDiagnostics()
+    }
+
+    /// Opens the local folder containing raw parser selections and diagnostic records.
+    @objc private func openDiagnostics() {
+        do {
+            try DiagnosticsStore.shared.openDirectory()
+            diagnosticsStatus.stringValue = "本机日志目录已打开。日志最多占用 100 MiB。"
+        } catch {
+            diagnosticsStatus.stringValue = "无法打开日志目录：\(error.localizedDescription)"
+        }
+    }
+
+    /// Deletes the local diagnostics file only after the user selects Clear.
+    @objc private func clearDiagnostics() {
+        do {
+            try DiagnosticsStore.shared.clear()
+            diagnosticsStatus.stringValue = "本机解析诊断日志已清除。"
+        } catch {
+            diagnosticsStatus.stringValue = "无法清除日志：\(error.localizedDescription)"
+        }
+    }
+
+    private func refreshDiagnostics() {
+        let enabled = DiagnosticsStore.shared.isEnabled
+        diagnosticsEnabled.state = enabled ? .on : .off
+        let status = enabled
+            ? "仅记录 JSONC / JSON5 输入和解析异常，保存在本机，最多 100 MiB。内容可能含敏感信息。"
+            : "本地解析诊断已关闭。之前保存的日志仍可清理。"
+        diagnosticsStatus.stringValue = DiagnosticsStore.shared.storageError.map { "\(status)\n保存失败：\($0)" } ?? status
+    }
 
     @objc private func openSystemSettings() {
         if !AXIsProcessTrusted() {

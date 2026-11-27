@@ -18,19 +18,18 @@ final class SelectionFormatter {
     func formatSelection() async -> SelectionOutcome {
         guard !busy else { return .failure("正在处理选区。") }
         guard AXIsProcessTrusted() else { return .failure("请先在 UVFormatter 设置中开启辅助功能权限。") }
-        guard let target = Target.capture(), target.isTextControl else {
-            return .failure("请在可编辑区域中选中 JSON 或 XML。")
+        guard let target = Target.capture(), target.isCurrent else {
+            return .failure("未找到当前应用中的选区。")
         }
+        guard !target.isSecureTextField else { return .failure("安全输入框中的内容无法格式化。") }
         busy = true
         defer { busy = false }
 
-        if let source = target.selectedText {
-            guard !source.isEmpty else { return .failure("请先选中 JSON 或 XML。") }
+        if let source = target.selectedText, !source.isEmpty {
             return await format(source, in: target, range: target.selectedRange)
         }
-        if target.selectedRange?.length == 0 {
-            return .failure("请先选中 JSON 或 XML。")
-        }
+        // 外层控件的空选区可能与内嵌编辑器或消息正文的实际选区不同。
+        // 让宿主应用自己的复制命令尝试读取当前选区。
         return await formatByCopying(in: target)
     }
 
@@ -38,25 +37,53 @@ final class SelectionFormatter {
     /// AX 调用超时时写入状态不明，避免重复写入。
     private func format(_ source: String, in target: Target, range: NSRange?) async -> SelectionOutcome {
         let formatted: String
-        do { formatted = try Formatter.format(source) }
+        do { formatted = try parse(source, for: target).text }
         catch { return .failure(error.localizedDescription) }
         guard !source.utf8.elementsEqual(formatted.utf8) else { return .unchanged }
 
-        let canSetSelection = target.isSelectedTextSettable
+        guard target.canReplaceSelection else {
+            return .copyAvailable(formatted, reason: "当前选区可读取，无法确认可编辑。")
+        }
+        let before = target.value
+        let expected = range?.replacingSelection(source, with: formatted, in: before)
         guard target.selectedText?.utf8.elementsEqual(source.utf8) == true,
-              target.selectedRange == range, target.editability != false, target.isCurrent else {
+              target.selectedRange == range, target.isCurrent else {
             return .copyAvailable(formatted, reason: "选区、窗口或编辑权限有变化。")
         }
-        if canSetSelection {
+        if let element = target.element, target.isSelectedTextSettable {
             let result = AXUIElementSetAttributeValue(
-                target.element, kAXSelectedTextAttribute as CFString, formatted as CFString
+                element, kAXSelectedTextAttribute as CFString, formatted as CFString
             )
-            if result == .success { return .replaced }
-            if result == .cannotComplete {
-                return .writeUnconfirmed(formatted, reason: "编辑器未及时确认替换。")
+            if result == .success {
+                if let outcome = await confirmAXReplacement(
+                    expected: expected, before: before, source: source, formatted: formatted, in: target
+                ) {
+                    return outcome
+                }
+            } else if result == .cannotComplete {
+                guard target.isUnchanged(value: before, selectedText: source) else {
+                    return .writeUnconfirmed(formatted, reason: "编辑器未及时确认替换。")
+                }
             }
         }
         return await paste(formatted, replacing: source, in: target)
+    }
+
+    /// 核实直接写入 AX 属性是否生效；若编辑器接受了请求但全文与选区均未变化，返回 nil 以回退到粘贴。
+    private func confirmAXReplacement(
+        expected: String?, before: String?, source: String, formatted: String, in target: Target
+    ) async -> SelectionOutcome? {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(100))
+        while true {
+            if let expected, target.isCurrent, target.value?.utf8.elementsEqual(expected.utf8) == true {
+                return .replaced
+            }
+            if !target.isUnchanged(value: before, selectedText: source) {
+                return .writeUnconfirmed(formatted, reason: "编辑器接受了替换请求，但无法核实结果。请检查原选区。")
+            }
+            guard ContinuousClock.now < deadline, !Task.isCancelled else { return nil }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     /// 在选区文字未通过 AX 暴露时，以一次定向复制读取文本。触发粘贴前复核焦点与可用选区信息。
@@ -65,42 +92,75 @@ final class SelectionFormatter {
         let range = target.selectedRange
         let before = target.value
         let board = NSPasteboard.general
-        guard CGPreflightPostEventAccess(), let snapshot = ClipboardSnapshot(board), target.isCurrent,
-              let copy = KeyStroke(virtualKey: 8) else {
+        guard CGPreflightPostEventAccess(), let copy = KeyStroke(virtualKey: 8) else {
+            return .failure("无法读取当前选区。")
+        }
+        await waitForNonCommandModifiersRelease(in: target)
+        guard let snapshot = ClipboardSnapshot(board), target.isCurrent,
+              target.selectedRange == range, target.value == before else {
             return .failure("无法读取当前选区。")
         }
         let originalCount = snapshot.changeCount
         guard board.changeCount == originalCount else {
             return .failure("剪贴板在读取选区时已变化。")
         }
-        copy.post(to: target.pid)
+        copy.post()
         guard let copiedCount = await waitForCopy(on: board, after: originalCount, in: target) else {
             return .failure("未取得选区文本。请确认已选中文字。")
         }
-        guard let source = board.string(forType: .string), board.changeCount == copiedCount, !source.isEmpty else {
+        guard target.isCurrent, !target.isSecureTextField,
+              let source = snapshot.copiedText(from: board, changeCount: copiedCount) else {
             return .failure("未取得选区文本。")
         }
-        // 剪贴板没有写入者身份。只有在 AX 可独立佐证时才接管本次剪贴板内容。
+        // 剪贴板序号无法证明写入者身份。只有 AX 独立佐证时才记录原文或直接恢复复制前内容。
         let confirmsRange = range.flatMap { range in before.map { range.matches(source, in: $0) } } ?? false
+        let confirmsSelection = confirmsRange || target.selectedText?.utf8.elementsEqual(source.utf8) == true
         defer {
-            if confirmsRange { _ = snapshot.restoreIfOwned(board, changeCount: copiedCount) }
+            if confirmsSelection { _ = snapshot.restoreIfOwned(board, changeCount: copiedCount) }
         }
         let formatted: String
-        do { formatted = try Formatter.format(source) }
-        catch { return .failure(error.localizedDescription) }
+        do {
+            formatted = try confirmsSelection ? parse(source, for: target).text : Formatter.format(source)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
         guard !source.utf8.elementsEqual(formatted.utf8) else { return .unchanged }
 
-        guard confirmsRange,
-              target.isCurrent, target.editability != false,
-              target.selectedRange == range, target.value == before else {
-            return .copyAvailable(formatted, reason: "无法确认原选区仍可替换。")
+        guard target.isCurrent, target.selectedRange == range, target.value == before else {
+            return .copyAvailable(formatted, reason: "复制后焦点或选区发生变化。")
         }
-        return await writePaste(formatted, replacing: source, in: target, snapshot: snapshot, count: copiedCount)
+        return await writePaste(formatted, replacing: source, in: target, snapshot: snapshot,
+                                count: copiedCount, fromCopy: true, initialRangeMatches: confirmsRange)
+    }
+
+    /// Records parser failures and accepted JSONC/JSON5 selections to help improve dialect handling.
+    /// The store is local-only, defaults to enabled, and never persists strict JSON or XML success cases.
+    private func parse(_ source: String, for target: Target) throws -> FormattedSelection {
+        do {
+            let formatted = try Formatter.formatDetailed(source)
+            DiagnosticsStore.shared.record(source: source, targetBundleID: target.bundleID, formatted: formatted)
+            return formatted
+        } catch {
+            DiagnosticsStore.shared.record(source: source, targetBundleID: target.bundleID, error: error)
+            throw error
+        }
+    }
+
+    /// 避免默认快捷键 ⌘⌥⇧F 的 ⌥/⇧ 尚未松开时，合成的 ⌘C / ⌘V 被目标应用识别成带额外修饰键的快捷键。
+    private func waitForNonCommandModifiersRelease(in target: Target) async {
+        let extra: CGEventFlags = [.maskAlternate, .maskShift, .maskControl]
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(250))
+        while ContinuousClock.now < deadline, !Task.isCancelled,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid {
+            if CGEventSource.flagsState(.hidSystemState).intersection(extra).isEmpty { return }
+            try? await Task.sleep(for: .milliseconds(15))
+        }
     }
 
     private func waitForCopy(on board: NSPasteboard, after count: Int, in target: Target) async -> Int? {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(450))
-        while ContinuousClock.now < deadline, !Task.isCancelled, target.isCurrent {
+        while ContinuousClock.now < deadline, !Task.isCancelled,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid {
             let changed = board.changeCount
             if changed != count { return changed }
             try? await Task.sleep(for: .milliseconds(10))
@@ -121,25 +181,38 @@ final class SelectionFormatter {
     /// 保留新的外部剪贴板内容。恢复前留出目标应用读取剪贴板的时间。
     private func writePaste(
         _ formatted: String, replacing source: String,
-        in target: Target, snapshot: ClipboardSnapshot, count: Int
+        in target: Target, snapshot: ClipboardSnapshot, count: Int,
+        fromCopy: Bool = false, initialRangeMatches: Bool = false
     ) async -> SelectionOutcome {
         let board = NSPasteboard.general
         let reason = "无法安全写回当前选区。"
         let range = target.selectedRange
         let before = target.value
-        let confirmsRange = range.flatMap { range in before.map { range.matches(source, in: $0) } } ?? false
-        guard target.editability != false, target.isCurrent, board.changeCount == count,
-              target.selectedText?.utf8.elementsEqual(source.utf8) == true || confirmsRange,
+        func selectionStillMatches() -> Bool {
+            Self.selectionStillMatches(
+                currentSelection: target.selectedText,
+                range: range,
+                currentValue: before,
+                source: source,
+                fromCopy: fromCopy,
+                initialRangeMatches: initialRangeMatches
+            )
+        }
+        guard (fromCopy ? target.canPasteAfterCopy : target.canReplaceSelection),
+              target.isCurrent, selectionStillMatches(),
+              !fromCopy || snapshot.copiedText(from: board, changeCount: count)?.utf8.elementsEqual(source.utf8) == true,
+              board.changeCount == count,
               let paste = KeyStroke(virtualKey: 9), !Task.isCancelled else {
             return .copyAvailable(formatted, reason: reason)
         }
 
-        let expected: String?
-        if confirmsRange, let before, let range {
-            expected = (before as NSString).replacingCharacters(in: range, with: formatted)
-        } else {
-            expected = nil
+        await waitForNonCommandModifiersRelease(in: target)
+        guard target.isCurrent, target.selectedRange == range, target.value == before,
+              selectionStillMatches(), board.changeCount == count, !Task.isCancelled else {
+            return .copyAvailable(formatted, reason: reason)
         }
+
+        let expected = range?.replacingSelection(source, with: formatted, in: before)
 
         let temporary = NSPasteboardItem()
         guard temporary.setString(formatted, forType: .string) else {
@@ -156,12 +229,12 @@ final class SelectionFormatter {
         let ownedCount = board.changeCount
         defer { _ = snapshot.restoreIfOwned(board, changeCount: ownedCount) }
         guard target.selectedRange == range, target.value == before,
-              target.selectedText.map({ $0.utf8.elementsEqual(source.utf8) }) ?? confirmsRange,
-              target.isCurrent, board.changeCount == ownedCount else {
+              selectionStillMatches(), (fromCopy ? target.canPasteAfterCopy : target.canReplaceSelection),
+              target.isCurrent, board.changeCount == ownedCount, !Task.isCancelled else {
             return .copyAvailable(formatted, reason: reason)
         }
 
-        paste.post(to: target.pid)
+        paste.post()
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(500))
         while ContinuousClock.now < deadline, !Task.isCancelled, board.changeCount == ownedCount {
             if let expected, target.isCurrent, target.value?.utf8.elementsEqual(expected.utf8) == true { return .replaced }
@@ -169,6 +242,20 @@ final class SelectionFormatter {
         }
         if let expected, target.isCurrent, target.value?.utf8.elementsEqual(expected.utf8) == true { return .replaced }
         return .writeUnconfirmed(formatted, reason: "已尝试粘贴。请检查选中的文本是否已替换。")
+    }
+
+    static func selectionStillMatches(
+        currentSelection: String?,
+        range: NSRange?,
+        currentValue: String?,
+        source: String,
+        fromCopy: Bool,
+        initialRangeMatches: Bool
+    ) -> Bool {
+        if let currentSelection { return currentSelection.utf8.elementsEqual(source.utf8) }
+        if fromCopy && !initialRangeMatches { return true }
+        if let range, range.length > 0, let currentValue { return range.matches(source, in: currentValue) }
+        return fromCopy
     }
 }
 
@@ -194,6 +281,14 @@ struct ClipboardSnapshot {
         self.changeCount = before
     }
 
+    /// 在主线程读取本次复制后观测到的非空文本。序号只用于判断内容变化，不能标识写入者。
+    func copiedText(from board: NSPasteboard, changeCount observedCount: Int) -> String? {
+        guard observedCount != changeCount, board.changeCount == observedCount,
+              let text = board.string(forType: .string), !text.isEmpty,
+              board.changeCount == observedCount else { return nil }
+        return text
+    }
+
     /// 若系统剪贴板仍对应当前操作最后一次观察到的序号，恢复全部表示。
     /// 在主线程调用。失败返回 false。系统剪贴板的比较和写入无法原子执行。
     @discardableResult
@@ -209,18 +304,60 @@ private struct KeyStroke {
     let up: CGEvent
 
     init?(virtualKey: CGKeyCode) {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: false) else { return nil }
+        // 使用独立事件源，避免复用会话中尚未松开的 ⌥/⇧ 修饰键状态。
+        let source = CGEventSource(stateID: .privateState)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false) else { return nil }
         down.flags = .maskCommand
         up.flags = .maskCommand
         self.down = down
         self.up = up
     }
 
-    // 将按键发给已核对的进程，避免全局投递时切窗影响其他 App。
-    func post(to pid: pid_t) {
-        down.postToPid(pid)
-        up.postToPid(pid)
+    // 通过会话事件流投递给已复核的前台焦点，兼容 Electron / Chromium WebView 等多进程容器。
+    func post() {
+        down.post(tap: .cgSessionEventTap)
+        up.post(tap: .cgSessionEventTap)
+    }
+}
+
+struct ElementAccessibilitySnapshot: Equatable {
+    let role: String?
+    let subrole: String?
+    let editable: Bool?
+    let isSelectedTextSettable: Bool
+    let isValueSettable: Bool
+
+    var isSecureTextField: Bool { subrole == kAXSecureTextFieldSubrole }
+    var isTextInputRole: Bool { [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role ?? "") }
+    var isWebArea: Bool { role == "AXWebArea" }
+    var isReadOnlyLeafRole: Bool { role == kAXStaticTextRole || role == "AXLink" }
+}
+
+enum EditabilityEvaluator {
+    /// 判断焦点控件（含富文本/WebView 内嵌节点及直接外层容器）是否可接受自动写回或粘贴。
+    static func canEdit(hasWindow: Bool, chain: [ElementAccessibilitySnapshot], afterCopy: Bool) -> Bool {
+        guard hasWindow else { return false }
+        guard let focused = chain.first else { return afterCopy }
+        guard !focused.isSecureTextField else { return false }
+
+        if focused.isSelectedTextSettable || focused.isValueSettable || focused.editable == true { return true }
+        if focused.isTextInputRole { return focused.editable != false }
+        // Chromium / Electron / WebKit 对话框经常只暴露外层 AXWebArea 且标记 AXEditable = false 或缺失，
+        // 无法从 AX 区分只读网页与富文本输入区时交给宿主决定是否接受粘贴。
+        if focused.isWebArea { return true }
+
+        let hasEditableAncestor = chain.dropFirst().contains { ancestor in
+            !ancestor.isSecureTextField && (
+                ancestor.isSelectedTextSettable || ancestor.isValueSettable
+                    || ancestor.editable == true
+                    || (ancestor.isTextInputRole && ancestor.editable != false)
+            )
+        }
+        if hasEditableAncestor { return true }
+
+        if focused.editable == false || focused.isReadOnlyLeafRole { return false }
+        return afterCopy
     }
 }
 
@@ -228,44 +365,84 @@ private struct KeyStroke {
 private struct Target {
     let pid: pid_t
     let bundleID: String?
-    let window: AXUIElement
-    let element: AXUIElement
+    let window: AXUIElement?
+    let element: AXUIElement?
 
     static func capture() -> Target? {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return nil }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.2)
-        guard let window = child(appElement, kAXFocusedWindowAttribute),
-              let element = child(appElement, kAXFocusedUIElementAttribute) else { return nil }
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
+        let window = child(appElement, kAXFocusedWindowAttribute)
+        let element = child(appElement, kAXFocusedUIElementAttribute)
         return Target(pid: app.processIdentifier, bundleID: app.bundleIdentifier, window: window, element: element)
     }
 
     var isCurrent: Bool {
         guard let current = Self.capture() else { return false }
-        return current.pid == pid && CFEqual(current.window, window) && CFEqual(current.element, element)
+        return current.pid == pid && Self.sameElement(current.window, window)
+            && Self.sameElement(current.element, element)
+            && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
     }
 
-    var isTextControl: Bool {
-        let role = Self.attribute(element, kAXRoleAttribute) as? String
-        let subrole = Self.attribute(element, kAXSubroleAttribute) as? String
-        guard subrole != kAXSecureTextFieldSubrole else { return false }
-        return [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role ?? "")
-            || editability == true || (isKnownEditor && role == "AXWebArea")
+    private static func sameElement(_ lhs: AXUIElement?, _ rhs: AXUIElement?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        return CFEqual(lhs, rhs)
     }
 
-    var isKnownEditor: Bool {
-        ["com.alibaba.DingTalkMac", "com.tencent.xinWeChat", "com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"]
-            .contains(bundleID ?? "")
+    var isSecureTextField: Bool {
+        Self.attribute(element, kAXSubroleAttribute) as? String == kAXSecureTextFieldSubrole
     }
 
-    var editability: Bool? { Self.attribute(element, "AXEditable") as? Bool }
+    func isUnchanged(value before: String?, selectedText source: String) -> Bool {
+        guard isCurrent else { return false }
+        let valueUnchanged: Bool
+        switch (before, value) {
+        case (nil, nil): valueUnchanged = true
+        case let (lhs?, rhs?): valueUnchanged = lhs.utf8.elementsEqual(rhs.utf8)
+        default: valueUnchanged = false
+        }
+        return valueUnchanged && selectedText?.utf8.elementsEqual(source.utf8) == true
+    }
+
+    // 缺少内部控件信息的窗口依靠宿主执行粘贴，明确只读的控件只提供复制结果。
+    var canPasteAfterCopy: Bool {
+        EditabilityEvaluator.canEdit(hasWindow: window != nil, chain: accessibilityChain, afterCopy: true)
+    }
+
+    // 控件角色和兼容规则只用于判断自动写回，不依赖具体宿主应用白名单。
+    var canReplaceSelection: Bool {
+        EditabilityEvaluator.canEdit(hasWindow: window != nil, chain: accessibilityChain, afterCopy: false)
+    }
+
+    private var accessibilityChain: [ElementAccessibilitySnapshot] {
+        var chain: [ElementAccessibilitySnapshot] = []
+        var current = element
+        for _ in 0..<5 {
+            guard let node = current else { break }
+            let snapshot = ElementAccessibilitySnapshot(
+                role: Self.attribute(node, kAXRoleAttribute) as? String,
+                subrole: Self.attribute(node, kAXSubroleAttribute) as? String,
+                editable: Self.attribute(node, "AXEditable") as? Bool,
+                isSelectedTextSettable: Self.isSettable(kAXSelectedTextAttribute, on: node),
+                isValueSettable: Self.isSettable(kAXValueAttribute, on: node)
+            )
+            if !chain.isEmpty && (snapshot.role == kAXWindowRole || snapshot.role == kAXApplicationRole) {
+                break
+            }
+            chain.append(snapshot)
+            if snapshot.role == "AXWebArea" { break }
+            current = Self.child(node, kAXParentAttribute)
+        }
+        return chain
+    }
+
     var selectedText: String? {
-        if let selection = Self.attribute(element, kAXSelectedTextAttribute) as? String {
+        if let selection = Self.attribute(element, kAXSelectedTextAttribute) as? String, !selection.isEmpty {
             return selection
         }
         // 部分编辑器通过按范围取文本接口暴露选区。
-        guard let range = selectedRange, range.length > 0 else { return nil }
+        guard let element, let range = selectedRange, range.length > 0 else { return nil }
         var coordinates = CFRange(location: range.location, length: range.length)
         guard let parameter = AXValueCreate(.cfRange, &coordinates) else { return nil }
         var value: CFTypeRef?
@@ -285,12 +462,18 @@ private struct Target {
         return NSRange(location: range.location, length: range.length)
     }
     var isSelectedTextSettable: Bool {
+        guard let element else { return false }
+        return Self.isSettable(kAXSelectedTextAttribute, on: element)
+    }
+
+    private static func isSettable(_ attribute: String, on element: AXUIElement) -> Bool {
         var writable: DarwinBoolean = false
-        return AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &writable) == .success
+        return AXUIElementIsAttributeSettable(element, attribute as CFString, &writable) == .success
             && writable.boolValue
     }
 
-    private static func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+    private static func attribute(_ element: AXUIElement?, _ key: String) -> CFTypeRef? {
+        guard let element else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
         return value
@@ -302,7 +485,13 @@ private struct Target {
     }
 }
 
-private extension NSRange {
+extension NSRange {
+    // 仅当原选区与提供的 UTF-16 范围一致时生成预期全文，供写入后回读比较。
+    func replacingSelection(_ source: String, with replacement: String, in original: String?) -> String? {
+        guard let original, matches(source, in: original) else { return nil }
+        return (original as NSString).replacingCharacters(in: self, with: replacement)
+    }
+
     // AX 文本范围使用 UTF-16，用 NSString 按相同单位检查边界和原选区。
     func matches(_ selection: String, in text: String) -> Bool {
         let text = text as NSString
