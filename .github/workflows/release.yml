@@ -1,0 +1,130 @@
+name: macOS Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uvformatter-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'edmondzhang/UVFormatter'
+    runs-on: macos-15
+    environment: release
+    permissions:
+      contents: write
+      pages: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION_TAG: ${{ github.ref_name }}
+      SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release source and metadata
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/appcast.py validate-tag "$VERSION_TAG"
+          git merge-base --is-ancestor HEAD origin/main
+          python3 .github/scripts/appcast.py public-key
+          /usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' UVFormatter/Info.plist >/dev/null
+          if gh release view "$VERSION_TAG" > /dev/null 2>&1; then
+            gh release view "$VERSION_TAG" --json isDraft --jq '"draft=\(.isDraft)"' >> "$GITHUB_OUTPUT"
+            gh release view "$VERSION_TAG" --json isPrerelease --jq '.isPrerelease | not' | grep -qx true
+          else
+            echo 'draft=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Test the tagged commit
+        if: steps.release.outputs.draft == 'true'
+        run: |
+          xcodebuild test -project UVFormatter.xcodeproj -scheme UVFormatter \
+            -destination 'platform=macOS' -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Get Sparkle signing tool
+        id: sparkle
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparkle_version=$(python3 -c 'import json, pathlib; files=list(pathlib.Path("UVFormatter.xcodeproj").rglob("Package.resolved")); assert len(files)==1; print(next(pin["state"]["version"] for pin in json.loads(files[0].read_text())["pins"] if pin["identity"]=="sparkle"))')
+          work=$(mktemp -d "$RUNNER_TEMP/sparkle.XXXXXX")
+          asset_name="Sparkle-$sparkle_version.tar.xz"
+          gh release download "$sparkle_version" --repo sparkle-project/Sparkle --pattern "$asset_name" --dir "$work"
+          digest=$(gh api "repos/sparkle-project/Sparkle/releases/tags/$sparkle_version" --jq ".assets[] | select(.name == \"$asset_name\") | .digest")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "${digest#sha256:}" "$work/$asset_name" | shasum -a 256 -c -
+          tar -xf "$work/$asset_name" -C "$work"
+          test -x "$work/bin/sign_update"
+          printf 'tool=%s\n' "$work/bin/sign_update" >> "$GITHUB_OUTPUT"
+      - name: Build, sign and notarize
+        if: steps.release.outputs.draft == 'true'
+        shell: bash
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: bash .github/scripts/build-release.sh
+      - name: Publish signed release
+        if: steps.release.outputs.draft == 'true'
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_SIGN_UPDATE: ${{ steps.sparkle.outputs.tool }}
+        run: |
+          set -euo pipefail
+          : "${SPARKLE_PRIVATE_KEY:?Configure the Sparkle update signing secret}"
+          work="$RUNNER_TEMP/uvformatter-release"
+          archive="$work/UVFormatter-$VERSION_TAG.zip"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_SIGN_UPDATE" --ed-key-file - "$archive" |
+            python3 .github/scripts/appcast.py record "$VERSION_TAG" "$archive" > "$work/update.json"
+          if ! gh release view "$VERSION_TAG" > /dev/null 2>&1; then
+            gh release create "$VERSION_TAG" --verify-tag --draft --generate-notes --title "UVFormatter $VERSION_TAG"
+          fi
+          gh release upload "$VERSION_TAG" "$archive" "$work/update.json" --clobber
+          gh release edit "$VERSION_TAG" --draft=false
+      - name: Generate Pages update feed
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_SIGN_UPDATE: ${{ steps.sparkle.outputs.tool }}
+        run: |
+          set -euo pipefail
+          : "${SPARKLE_PRIVATE_KEY:?Configure the Sparkle update signing secret}"
+          python3 .github/scripts/appcast.py publish-feed site
+          proof="$RUNNER_TEMP/uvformatter-key-check.txt"
+          printf '%s\n' 'UVFormatter update key check' > "$proof"
+          signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_SIGN_UPDATE" --ed-key-file - -p "$proof")
+          swift .github/scripts/verify-update.swift "$proof" "$signature"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_SIGN_UPDATE" --ed-key-file - site/appcast.xml
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_SIGN_UPDATE" --ed-key-file - --verify site/appcast.xml
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy update feed
+        uses: actions/deploy-pages@v4
+        id: deployment
